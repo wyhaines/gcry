@@ -119,6 +119,7 @@ module Gcry
       # `WeakRef`. Sticky keeps the answer the comment promises — slow, never
       # wrong.
       @disabled = false
+      @sparse_after_rehash = false
 
       def initialize
       end
@@ -145,6 +146,7 @@ module Gcry
         @slots = Pointer(IndexSlot).null
         @cap = 0
         @used = 0
+        @sparse_after_rehash = false
       end
 
       # The state a refused `grow` allocation leaves.
@@ -241,7 +243,17 @@ module Gcry
       private def grow(& : Int32* ->) : Nil
         old_table = @slots
         old_cap = @cap
-        new_cap = old_cap == 0 ? 64 : old_cap * 2
+        # A small index can grow to fit a cycling set of addresses. Past
+        # 64 KiB, reuse its capacity if the last rehash discarded most slots.
+        # If the live set has grown since, this rehash sees it and the next
+        # insertion can double the table. No extra probe on the delete path.
+        new_cap = if old_cap == 0
+                    64
+                  elsif old_cap >= 4096 && @sparse_after_rehash
+                    old_cap
+                  else
+                    old_cap * 2
+                  end
         bytes = (new_cap * sizeof(IndexSlot)).to_u64
         fresh = LibC.malloc(LibC::SizeT.new(bytes)).as(IndexSlot*)
         # Out of C memory: drop the table entirely rather than half-fill it,
@@ -289,6 +301,7 @@ module Gcry
           end
           j += 1
         end
+        @sparse_after_rehash = @used <= old_cap // 4
         yield remap
         LibC.free(old_table.as(Void*))
       end

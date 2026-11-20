@@ -31,6 +31,34 @@ describe "finalizer registration index" do
     end
   end
 
+  it "bounds index capacity when fresh registrations disappear and one survives" do
+    registry = Gcry::Finalizers::Registry.new
+    callback = ->(_object : Void*) { }
+    anchor = Pointer(Void).new(0x1000_u64)
+    begin
+      registry.add(anchor, callback)
+      after_warmup = 0
+      65_536.times do |i|
+        object = Pointer(Void).new(0x20_000_u64 + i.to_u64 * 48)
+        registry.add(object, callback)
+        registry.notice_reclaim(object, 16_u64)
+        after_warmup = registry.index_cap if i == 8191
+      end
+      registry.index_cap.should eq(after_warmup)
+
+      # A later burst with genuinely live rows must grow and remap them.
+      keys = Array(Void*).new(after_warmup) { |i| Pointer(Void).new(0x80_0000_u64 + i.to_u64 * 16) }
+      keys.each { |key| registry.add(key, callback) }
+      registry.index_cap.should be > after_warmup
+      keys.each { |key| registry.notice_reclaim(key, 16_u64) }
+      registry.notice_reclaim(anchor, 16_u64)
+      registry.entry_count.should eq(0)
+      registry.debug_index_error.should be_nil
+    ensure
+      registry.clear
+    end
+  end
+
   it "survives churn that fills the index with tombstones" do
     # index_grow rehashes live rows only, which is what stops a table churned by
     # add/remove from degrading into a full probe.
