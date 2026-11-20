@@ -27,6 +27,27 @@ describe "process GC (-Dgc_none)" do
     Gcry::VERSION.should_not be_empty
   end
 
+  it "round-trips buffered files across the small allocation boundary" do
+    default = IO::DEFAULT_BUFFER_SIZE
+    expected = default == Gcry::SizeClasses::THRESHOLD ? default - 1 : default
+    data = Bytes.new(default * 2 + 3) { |i| (i % 251).to_u8 }
+    [expected, default].each do |size|
+      file = File.tempfile("gcry-buffer")
+      begin
+        file.buffer_size.should eq(expected)
+        file.buffer_size = size
+        data.each { |byte| file.write_byte(byte) }
+        file.rewind
+        data.each { |byte| file.read_byte.should eq(byte) }
+        file.read_byte.should be_nil
+        file.buffer_size.should eq(size)
+      ensure
+        file.close
+        file.delete
+      end
+    end
+  end
+
   it "malloc / malloc_atomic / free via GC" do
     p = GC.malloc(64)
     GC.is_heap_ptr(p).should be_true

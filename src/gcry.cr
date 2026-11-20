@@ -241,6 +241,7 @@ end
 
 {% if flag?(:gc_none) %}
   require "./gcry/gc_override"
+  require "./gcry/crystal_buffered_io"
   require "./gcry/crystal_process_compat"
   require "./gcry/crystal_raises_compat"
   require "./gcry/crystal_string_builder_compat"
