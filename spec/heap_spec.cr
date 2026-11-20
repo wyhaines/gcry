@@ -214,6 +214,57 @@ describe Gcry::Heap do
     end
   end
 
+  it "preserves FIFO reuse after removing a large bucket's middle, tail and head" do
+    heap = Gcry::Heap.new
+    begin
+      heap.gc_threshold = UInt64::MAX
+      heap.large_recycle = false
+      heap.large_cache_retain = 64_u64 << 20
+      page = Gcry::Platform.host_page_size
+      x, y, z = 16 * page, 18 * page, 20 * page
+      first = heap.malloc(x)
+      middle = heap.malloc(y)
+      second = heap.malloc(x)
+      tail = heap.malloc(z)
+      {first, middle, second, tail}.each { |ptr| heap.free(ptr) }
+
+      heap.malloc(y).should eq(middle)
+      heap.malloc(z).should eq(tail)
+      heap.free(middle)
+      heap.free(tail)
+      heap.malloc(x).should eq(first)
+      heap.free(first)
+      heap.malloc(x).should eq(second)
+      heap.malloc(x).should eq(first)
+      heap.malloc(y).should eq(middle)
+      heap.malloc(z).should eq(tail)
+      heap.large_free_bytes.should eq(0)
+    ensure
+      heap.destroy
+    end
+  end
+
+  it "forgets a former head's tail hint when that block rejoins the bucket" do
+    heap = Gcry::Heap.new
+    begin
+      heap.gc_threshold = UInt64::MAX
+      heap.large_recycle = false
+      a, b, c, d = StaticArray(Void*, 4).new { heap.malloc(100_000) }
+      {a, b, c}.each { |ptr| heap.free(ptr) }
+      heap.malloc(100_000).should eq(a)
+      heap.free(a)
+      heap.malloc(100_000).should eq(b)
+      heap.malloc(100_000).should eq(c)
+      # a is the head again. Its old tail, c, belongs to the caller.
+      heap.free(d)
+      heap.malloc(100_000).should eq(a)
+      heap.malloc(100_000).should eq(d)
+      heap.large_free_bytes.should eq(0)
+    ensure
+      heap.destroy
+    end
+  end
+
   it "malloc re-zeros large objects taken from the cache" do
     heap = Gcry::Heap.new
     begin

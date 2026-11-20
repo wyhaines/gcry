@@ -590,7 +590,8 @@ module Gcry
     # Not a `ChunkHeader` field: every chunk would pay for it, the header is
     # full at 32 bytes, and 40 would put every small chunk's first block off
     # its 16-byte alignment. Sixteen bytes here keep the large block header
-    # and the object behind it 16-aligned; the second word is unused. Small
+    # and the object behind it 16-aligned. A large free bucket's head stores
+    # its tail hint in the second word (`Heap#large_cache_tail_slot`). Small
     # chunks have no back-link, and nothing needs one: only a large chunk
     # leaves the list on its own (a trim, a recycle); the sweep drops small
     # chunks inside the walk that rebuilds the list.

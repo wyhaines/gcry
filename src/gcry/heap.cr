@@ -3347,6 +3347,7 @@ module Gcry
           m = c.value.mapped_bytes
           if m >= mapped && (best.null? || m < best_mapped) && !ChunkHeader.moved?(c)
             best, best_prev, best_bucket, best_mapped = user, prev, i, m
+            break if m == mapped
           end
           prev = user
           user = large_next(user)
@@ -3373,6 +3374,7 @@ module Gcry
       if best_prev.null?
         @large_freelists[best_bucket] = nxt
       else
+        large_cache_tail_slot(@large_freelists[best_bucket]).value = best_prev if nxt.null?
         ph = BlockHeader.large_header_from_user(best_prev)
         pv = ph.value
         pv.next_free = nxt
@@ -3420,23 +3422,28 @@ module Gcry
       payload = BlockHeader.large_size(header)
       bucket = self.class.large_bucket(mapped)
       user = BlockHeader.large_user_from_header(header)
-      # Find tail of bucket freelist. Every entry is an indexed chunk, so a
-      # walk more than twice the index long has gone round a cycle: it did
-      # once, spinning here for 900 s under the lazy sweep (`pattern_fuzz`
-      # seed 20279, campaign-037, 2026-09-30). Stop and name it.
-      tail = @large_freelists[bucket]
-      limit = @chunk_index_count.to_u64 &* 2 &+ 64
-      steps = 0_u64
-      while tail
-        th = BlockHeader.large_header_from_user(tail)
-        tnxt = th.value.next_free
-        break if tnxt.null?
-        tail = tnxt
-        steps &+= 1
-        report_large_bucket_cycle(bucket, user, limit) if steps > limit
+      # A head that survived the previous append knows the current tail. If a
+      # take or trim popped that head, its successor starts with an empty hint.
+      head = @large_freelists[bucket]
+      tail = head
+      if head
+        tail = large_cache_tail_slot(head).value
+        if tail.null?
+          tail = head
+          limit = @chunk_index_count.to_u64 &* 2 &+ 64
+          steps = 0_u64
+          while nxt = large_next(tail)
+            tail = nxt
+            steps &+= 1
+            report_large_bucket_cycle(bucket, user, limit) if steps > limit
+          end
+        end
       end
       poison_payload(user, payload) if @poison_freed
       header.value = BlockHeader.large(payload, BlockHeader::Flags::FREE | BlockHeader::Flags::LARGE)
+      # Only a head may own a hint. Clear it even when this address was the
+      # head of an older queue before the application reused the block.
+      large_cache_tail_slot(user).value = Pointer(Void).null
       if tail.null?
         @large_freelists[bucket] = user
       else
@@ -3444,9 +3451,17 @@ module Gcry
         tv = th.value
         tv.next_free = user
         th.value = tv
+        large_cache_tail_slot(head).value = user
       end
       @free_bytes.add(mapped)
       @large_free_bytes += mapped
+    end
+
+    # The second word of LARGE_LINK_BYTES immediately precedes the block
+    # header. Only the head owns a hint. An unlink of a non-head tail sets
+    # the hint to its predecessor under the same allocation lock.
+    private def large_cache_tail_slot(user : Void*) : Void**
+      (BlockHeader.large_header_from_user(user).as(UInt8*) - sizeof(Void*)).as(Void**)
     end
 
     private def large_next(user : Void*) : Void*
@@ -3551,6 +3566,7 @@ module Gcry
           if prev.null?
             @large_freelists[b] = nxt
           else
+            large_cache_tail_slot(@large_freelists[b]).value = prev if nxt.null?
             ph = BlockHeader.large_header_from_user(prev)
             pv = ph.value
             pv.next_free = nxt
@@ -3871,6 +3887,7 @@ module Gcry
               if prev.null?
                 @large_freelists[b] = nxt
               else
+                large_cache_tail_slot(@large_freelists[b]).value = prev if nxt.null?
                 ph = BlockHeader.large_header_from_user(prev)
                 pv = ph.value
                 pv.next_free = nxt
