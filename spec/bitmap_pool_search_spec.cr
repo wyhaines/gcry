@@ -106,6 +106,35 @@ describe "bitmap pool capacity search" do
     end
   end
 
+  it "merges a single free into the remaining candidates in address order" do
+    heap = Gcry::Heap.new
+    begin
+      heap.bitmap_alloc = true
+      heap.nursery_enabled = false
+      heap.gc_threshold = UInt64::MAX
+      heap.blacklist_enabled = false
+      first = heap.malloc(8192)
+      blocks = 0
+      heap.each_chunk do |chunk|
+        blocks = Gcry::Heap.chunk_block_count((8192 + Gcry::BlockHeader::SIZE).to_u64,
+          chunk.value.mapped_bytes, chunk.value.data_offset).to_i
+      end
+      pointers = [first]
+      (5 * blocks - 1).times { pointers << heap.malloc(8192) }
+      representatives = pointers.each_slice(blocks).map(&.first).to_a.sort_by(&.address)
+      [2, 4, 1].each { |i| heap.free(representatives[i]) }
+      heap.malloc(8192).should eq(representatives[1])
+      visits = heap.bitmap_pool_chunk_visits
+      heap.free(representatives[0])
+      heap.malloc(8192).should eq(representatives[0])
+      heap.free(representatives[3])
+      [2, 3, 4].each { |i| heap.malloc(8192).should eq(representatives[i]) }
+      heap.bitmap_pool_chunk_visits.should eq(visits)
+    ensure
+      heap.destroy
+    end
+  end
+
   it "reuses swept capacity and retired partially occupied cursors" do
     heap = Gcry::Heap.new
     begin
