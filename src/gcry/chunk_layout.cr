@@ -117,7 +117,7 @@ module Gcry
     # representation is off — the chunk then looks exactly as it did before,
     # apart from the eight bytes the header itself grew.
     def self.chunk_geometry(block_bytes : UInt64, mapped_bytes : UInt64,
-                            bitmaps : Bool) : {UInt32, UInt32}
+                            bitmaps : Bool, pool_links : Bool = false) : {UInt32, UInt32}
       # Large chunks (bitmaps == false) hold exactly one object and keep a real
       # block header — under headerless it is reserved *inside the metadata
       # region*, between the back-link slot and data_start, rather than in
@@ -144,6 +144,7 @@ module Gcry
       # Two bitmaps, then round the first block up to 16 so payloads keep the
       # alignment they have today.
       offset = ChunkHeader::SIZE.to_u64 + words.to_u64 * 2 * 8
+      offset += sizeof(BitmapPoolLinks) if pool_links
       offset = (offset + 15) & ~15_u64
       {words, offset.to_u32}
     end

@@ -389,6 +389,7 @@ module Gcry
                       # saturating subtraction cannot run ahead of the add.
                       dormant_bytes_add(mapped)
                       ChunkHeader.set_dormant(chunk, true)
+                      bitmap_capacity_changed(chunk) if bitmap_pool_member?(chunk)
                       dormant_budget_used += mapped
                       if ChunkHeader.nursery?(chunk)
                         rebuild_nursery_mask |= bit
@@ -425,6 +426,13 @@ module Gcry
                         @grow_lo[class_index] = 0_u64
                         @grow_hi[class_index] = 0_u64
                         @prefer_freelists[class_index] = Pointer(Void).null
+                      end
+                      if bitmap_pool_member?(chunk)
+                        if after_world
+                          @chunk_list_lock.sync { bitmap_pool_unlink(chunk) }
+                        else
+                          bitmap_pool_unlink(chunk)
+                        end
                       end
                       ChunkHeader.set_next(chunk, to_unmap)
                       to_unmap = chunk
@@ -1054,6 +1062,10 @@ module Gcry
         nxt = keep.value.next
         # `link` gives the old head its back-link; *keep* is a size-class
         # chunk and keeps none.
+        if bitmap_pool_member?(keep)
+          bitmap_pool_link(keep)
+          bitmap_capacity_changed(keep)
+        end
         ChunkHeader.link(keep, @chunks)
         Atomic::Ops.store(pointerof(@chunks), keep, :release, true)
         keep = nxt

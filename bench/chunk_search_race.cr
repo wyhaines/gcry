@@ -108,8 +108,6 @@ class Gcry::Heap
         pool.value.addresses[0] = target.address
         pool.value.count = 1
         pool.value.next_index = 0
-        pool.value.version = Atomic::Ops.load(@bitmap_capacity_versions.to_unsafe + slot,
-          LLVM::AtomicOrdering::Acquire, false)
         pool.value.blacklist_enabled = @blacklist_enabled
         pool.value.valid = true
       when "handoff-overflow"
@@ -345,8 +343,6 @@ class Gcry::Heap
         pool.value.addresses[0] = ChunkSearchRace.target
         pool.value.count = 1
         pool.value.next_index = 0
-        pool.value.version = Atomic::Ops.load(@bitmap_capacity_versions.to_unsafe + slot,
-          LLVM::AtomicOrdering::Acquire, false)
         pool.value.blacklist_enabled = @blacklist_enabled
         pool.value.valid = true
         bitmap_take_pool_chunk(index, payload, false)
@@ -429,6 +425,12 @@ if ARGV.first? == "--child"
   ChunkSearchRace.arm(chunk.address)
   peer = Thread.new { heap.chunk_search_trim_peer }
   heap.chunk_search_probe(mode)
+  if mode == "bitmap-dormant" && ChunkSearchRace.target != chunk.address
+    raise "bitmap dormant discovery read an unrelated large chunk"
+  end
+  # If discovery skipped the unrelated mapping, the trim peer is still
+  # waiting. Disarm the read hook before that peer reads its own target.
+  ChunkSearchRace.arm(0_u64)
   ChunkSearchRace.stage = 3
   peer.join
   heap.destroy

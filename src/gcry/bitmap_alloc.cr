@@ -78,6 +78,15 @@ module Gcry
     end
   end
 
+  # Stored immediately before the payload area of regular bitmap chunks.
+  struct BitmapPoolLinks
+    property previous : ChunkHeader*
+    property following : ChunkHeader*
+
+    def initialize(@previous, @following)
+    end
+  end
+
   # Reusable-capacity index for one (class, kind), owned by its class lock.
   # Store addresses, not dereferenceable cached ChunkHeader pointers: mappings
   # may disappear at a collection. Every pop resolves the address through the
@@ -87,7 +96,8 @@ module Gcry
     property capacity : Int32 = 0
     property count : Int32 = 0
     property next_index : Int32 = 0
-    property version : UInt64 = 0_u64
+    property extra_address : UInt64 = 0_u64
+    property probe_dormant : Bool = false
     property valid : Bool = false
     property blacklist_enabled : Bool = false
   end
@@ -354,17 +364,25 @@ module Gcry
     # two clears — the control arm of regression 91 (`bitmap_free_block`).
     property bitmap_free_claim_guard : Bool = true
 
-    # A failed capacity search remains true until a free, sweep, or retirement
-    # publishes capacity for this (class, kind). The same generation invalidates
-    # the available-address index; neither cache owns or pins any chunk.
-    @bitmap_capacity_versions = uninitialized StaticArray(UInt64, POOL_SLOTS)
-    @bitmap_empty_versions = uninitialized StaticArray(UInt64, POOL_SLOTS)
+    # Each slot records no change (0), one changed mapping base, or changes
+    # to several mappings. A stopped-world sweep can interrupt a publisher.
+    # The consumer drains the word before looking: a publication during its
+    # search survives for the next refill.
+    MULTIPLE_POOL_CHUNKS = UInt64::MAX
+    @bitmap_changed_chunks = uninitialized StaticArray(UInt64, POOL_SLOTS)
+    @bitmap_class_heads = uninitialized StaticArray(ChunkHeader*, POOL_SLOTS)
     @bitmap_pool_indexes = uninitialized StaticArray(BitmapPoolIndex, POOL_SLOTS)
+    @bitmap_visit_counts = uninitialized StaticArray(UInt64, POOL_SLOTS)
     @bitmap_search_counts = uninitialized StaticArray(UInt64, POOL_SLOTS)
     @bitmap_search_skip_counts = uninitialized StaticArray(UInt64, POOL_SLOTS)
 
     def bitmap_pool_searches : UInt64
       @bitmap_search_counts.sum
+    end
+
+    # Chunks examined during pool discovery and dormant searches.
+    def bitmap_pool_chunk_visits : UInt64
+      @bitmap_visit_counts.sum
     end
 
     def bitmap_pool_search_skips : UInt64
@@ -377,7 +395,7 @@ module Gcry
     property pool_index_disabled : Bool = false
 
     private def bitmap_capacity_changed(chunk : ChunkHeader*) : Nil
-      bitmap_capacity_bump(bitmap_capacity_slot(chunk))
+      bitmap_publish_capacity(bitmap_capacity_slot(chunk), chunk.address)
     end
 
     @[AlwaysInline]
@@ -387,22 +405,23 @@ module Gcry
       slot
     end
 
-    private def bitmap_capacity_bump(slot : Int32) : Nil
-      # A signal can suspend an explicit free while the collector also frees
-      # this class. Atomic addition prevents losing either invalidation.
-      # Release/acquire publishes the preceding occupancy/ownership changes
-      # with the generation on weakly ordered CPUs as well as x86.
-      Atomic::Ops.atomicrmw(LLVM::AtomicRMWBinOp::Add,
-        @bitmap_capacity_versions.to_unsafe + slot, 1_u64,
-        LLVM::AtomicOrdering::Release, false)
+    private def bitmap_publish_capacity(slot : Int32, address : UInt64) : Nil
+      field = @bitmap_changed_chunks.to_unsafe + slot
+      old = Atomic::Ops.load(field, :monotonic, false)
+      loop do
+        value = (old == 0 || old == address) ? address : MULTIPLE_POOL_CHUNKS
+        old, ok = Atomic::Ops.cmpxchg(field, old, value, :release, :monotonic)
+        return if ok
+      end
     end
 
     protected def bitmap_alloc_init : Nil
       @cursor_sets = StaticArray(CursorSet*, MAX_CURSOR_SETS).new(Pointer(CursorSet).null)
       @cursor_set_count = 0
+      @bitmap_class_heads = StaticArray(ChunkHeader*, POOL_SLOTS).new(Pointer(ChunkHeader).null)
       @bitmap_pool_indexes = StaticArray(BitmapPoolIndex, POOL_SLOTS).new(BitmapPoolIndex.new)
-      @bitmap_capacity_versions = StaticArray(UInt64, POOL_SLOTS).new(1_u64)
-      @bitmap_empty_versions = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
+      @bitmap_changed_chunks = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
+      @bitmap_visit_counts = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
       @bitmap_search_counts = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
       @bitmap_search_skip_counts = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
     end
@@ -718,7 +737,7 @@ module Gcry
         if hook = @cursor_retire_hook
           hook.call(chunk)
         end
-        bitmap_capacity_bump(slot) if publish
+        bitmap_publish_capacity(slot, chunk.address) if publish
       end
     end
 
@@ -1360,28 +1379,78 @@ module Gcry
       end
     end
 
-    # Cache all available chunks in ascending address order. A rebuild costs
-    # one heap walk plus a sort, amortized across the available chunks instead
-    # of repeating the heap walk for every exhausted allocation cursor.
+    # Only normal bitmap chunks participate. Links occupy the last two words
+    # before data_start, outside the bitmaps and the discardable data pages.
+    # Membership follows the live chunk list under the same lock. A sweep
+    # can reorder that list without changing a pool.
+    private def bitmap_pool_member?(chunk : ChunkHeader*) : Bool
+      bitmap_alloc_chunk?(chunk) && chunk.value.bitmap_words != 0 && !ChunkHeader.reserve?(chunk)
+    end
+
+    @[AlwaysInline]
+    private def bitmap_pool_links(chunk : ChunkHeader*) : BitmapPoolLinks*
+      ChunkHeader.data_start(chunk).as(BitmapPoolLinks*) - 1
+    end
+
+    private def bitmap_pool_link(chunk : ChunkHeader*) : Nil
+      slot = bitmap_capacity_slot(chunk)
+      head = @bitmap_class_heads[slot]
+      links = bitmap_pool_links(chunk)
+      links.value = BitmapPoolLinks.new(Pointer(ChunkHeader).null, head)
+      bitmap_pool_links(head).value.previous = chunk if head
+      Atomic::Ops.store(@bitmap_class_heads.to_unsafe + slot, chunk, :release, true)
+    end
+
+    private def bitmap_pool_unlink(chunk : ChunkHeader*) : Nil
+      links = bitmap_pool_links(chunk)
+      prev, following = links.value.previous, links.value.following
+      if prev
+        bitmap_pool_links(prev).value.following = following
+      else
+        @bitmap_class_heads[bitmap_capacity_slot(chunk)] = following
+      end
+      bitmap_pool_links(following).value.previous = prev if following
+      links.value.previous = Pointer(ChunkHeader).null
+    end
+
+    private def each_bitmap_pool_member(slot : Int32, &)
+      visited = 0_u64
+      begin
+        chunk = @bitmap_class_heads[slot]
+        while chunk
+          visited &+= 1
+          yield chunk
+          chunk = bitmap_pool_links(chunk).value.following
+        end
+      ensure
+        @bitmap_visit_counts[slot] &+= visited
+      end
+    end
+
+    # Cache eligible addresses in ascending order. A rebuild visits only the
+    # requested size and pointer kind, including on optional metadata OOM.
     # Return a CURSOR-owned chunk: the STW sweep ignores the caller's class
     # lock, so ownership must survive the handoff to bitmap_refill_pool.
     protected def bitmap_take_pool_chunk(index : Int32, payload : UInt32,
                                          atomic : Bool) : ChunkHeader*
       slot = atomic ? index + SIZE_CLASS_COUNT : index
-      version = Atomic::Ops.load(@bitmap_capacity_versions.to_unsafe + slot,
-        LLVM::AtomicOrdering::Acquire, false)
+      field = @bitmap_changed_chunks.to_unsafe + slot
+      changed = Atomic::Ops.load(field, :acquire, false)
+      changed = Atomic::Ops.atomicrmw(:xchg, field, 0_u64, :acquire, false) unless changed == 0
       pool = @bitmap_pool_indexes.to_unsafe + slot
-      pool.value.valid = false if @pool_index_disabled
-      # Adding blacklist bits only removes capacity; each pop rechecks them.
-      # Disabling the blacklist can restore capacity, so a mode change rebuilds.
-      if pool.value.blacklist_enabled != @blacklist_enabled
-        pool.value.valid = false
-        @bitmap_empty_versions[slot] = 0_u64
+      pool.value.valid = false if @pool_index_disabled || pool.value.blacklist_enabled != @blacklist_enabled
+      if changed != 0
+        if changed == MULTIPLE_POOL_CHUNKS || (pool.value.extra_address != 0 && pool.value.extra_address != changed)
+          pool.value.valid = false
+        else
+          pool.value.extra_address = changed
+        end
       end
-      if !pool.value.valid || pool.value.version != version
+      unless pool.value.valid
+        pool.value.extra_address = 0_u64
+        pool.value.probe_dormant = false
         pool.value.count = 0
         pool.value.next_index = 0
-        pool.value.valid = false
         @bitmap_search_counts[slot] &+= 1
         # First refill of this slot: size the index before the walk, so the
         # common case indexes on its first pass. Outside the list lock (below):
@@ -1391,7 +1460,8 @@ module Gcry
         best = Pointer(ChunkHeader).null
         candidates = 0
         with_chunk_list_for_allocation do
-          each_chunk do |chunk|
+          each_bitmap_pool_member(slot) do |chunk|
+            pool.value.probe_dormant = true if ChunkHeader.dormant?(chunk)
             next unless bitmap_pool_candidate?(chunk, index, atomic)
             best = chunk if best.null? || chunk.address < best.address
             # Overflow is only counted here; the walk never allocates.
@@ -1413,15 +1483,22 @@ module Gcry
         end
         pool.value.count = candidates
         pool.value.addresses.to_slice(candidates).sort! if candidates > 1
-        pool.value.version = version
         pool.value.blacklist_enabled = @blacklist_enabled
         pool.value.valid = true
       end
 
-      while pool.value.next_index < pool.value.count
+      loop do
         at = pool.value.next_index
-        pool.value.next_index = at + 1
-        address = pool.value.addresses[at]
+        extra = pool.value.extra_address
+        if extra != 0 && (at == pool.value.count || extra <= pool.value.addresses[at])
+          address = extra
+          pool.value.extra_address = 0_u64
+        elsif at < pool.value.count
+          address = pool.value.addresses[at]
+          pool.value.next_index = at + 1
+        else
+          break
+        end
         # A stale address is harmless only after this lookup. Do not cast it
         # to ChunkHeader* or read its flags before the live index accepts it.
         # The check and the CURSOR store are one hold of the list lock: the
@@ -1429,7 +1506,11 @@ module Gcry
         # lock held by a frozen thread makes no chunk dormant (`Heap#sweep`).
         with_chunk_list_for_allocation do
           if chunk = bitmap_indexed_chunk(address)
+            pool.value.probe_dormant = true if ChunkHeader.dormant?(chunk)
             if chunk.address == address && bitmap_pool_candidate?(chunk, index, atomic)
+              # A capacity notification can outlive detachment for release.
+              # Only live list members may enter the cache through this path.
+              next if address == extra && @bitmap_class_heads[slot] != chunk && bitmap_pool_links(chunk).value.previous.null?
               if hook = @pool_take_hook
                 hook.call(chunk)
               end
@@ -1440,16 +1521,12 @@ module Gcry
         end
       end
 
-      if @bitmap_empty_versions[slot] == version
-        @bitmap_search_skip_counts[slot] &+= 1
-      else
-        # Dormant chunks need their own revive protocol: the data pages were
-        # discarded and must not be reused during a live flush walk.
+      if pool.value.probe_dormant
         revived, refused = bitmap_revive_dormant(index, atomic)
         return revived if revived
-        # Keep the entry version: a sweep may have happened while this thread
-        # was suspended. Its newer version must invalidate this result.
-        @bitmap_empty_versions[slot] = version unless refused
+        pool.value.probe_dormant = refused
+      else
+        @bitmap_search_skip_counts[slot] &+= 1
       end
       chunk = map_chunk(@small_chunk_bytes, index.to_u32,
         ChunkHeader::Flags::CURSOR | (atomic ? ChunkHeader::Flags::ATOMIC : 0_u32))
@@ -1546,7 +1623,16 @@ module Gcry
     # writes. Same flag flip and byte accounting as the header path; free bytes
     # were never subtracted when the chunk went dormant, so none are added back.
     private def bitmap_revive_dormant(index : Int32, atomic : Bool) : {ChunkHeader*?, Bool}
-      chunk = dormant_chunk_for_allocation(index, false, atomic)
+      slot = atomic ? index + SIZE_CLASS_COUNT : index
+      chunk = Pointer(ChunkHeader).null
+      with_chunk_list_for_allocation do
+        each_bitmap_pool_member(slot) do |member|
+          if ChunkHeader.dormant?(member)
+            chunk = member
+            break
+          end
+        end
+      end
       return {nil, false} unless chunk
       # The post-STW flush walks dormant chunks and DONTNEEDs their pages
       # without a lock, so a chunk revived after it read the flag would

@@ -4025,10 +4025,12 @@ module Gcry
                     else
                       ChunkHeader::SIZE.to_u32
                     end
+      pool_member = @bitmap_alloc && size_class < SIZE_CLASS_COUNT.to_u32 &&
+                    (flags & (ChunkHeader::Flags::NURSERY | ChunkHeader::Flags::RESERVE)) == 0
       if @bitmap_marks && size_class != UInt32::MAX &&
          size_class < SIZE_CLASS_COUNT.to_u32
         bitmap_words, data_offset =
-          Heap.chunk_geometry(@block_bytes[size_class.to_i32], bytes, true)
+          Heap.chunk_geometry(@block_bytes[size_class.to_i32], bytes, true, pool_links: pool_member)
       end
 
       # Prepend and index-insert under the **one** lock that guards `@chunks`.
@@ -4090,6 +4092,7 @@ module Gcry
         # between the REORDERED stores hands the walker an uninitialised
         # `next`. Same discipline as `index_insert_locked`'s count store.
         Atomic::Ops.store(pointerof(@chunks), chunk, :release, true)
+        bitmap_pool_link(chunk) if pool_member && bitmap_words != 0
         index_insert(chunk)
         # Release: a reader that sees null sees the index entry with it.
         Atomic::Ops.store(pointerof(@chunk_publishing), Pointer(ChunkHeader).null, :release, true)
@@ -4186,6 +4189,7 @@ module Gcry
       # which the caller unmaps it and the next walker faults.
       @chunk_list_lock.sync do
         @chunk_unlinks &+= 1
+        bitmap_pool_unlink(target) if bitmap_pool_member?(target)
         # `index_remove`, with the back-link's check in the same section: the
         # check reads the index and, if the chunk the link names is in it,
         # that chunk's `next`.
@@ -4453,14 +4457,12 @@ module Gcry
     # A selected dormant small chunk stays mapped after releasing the list
     # lock: the caller holds its class lock, and dormant chunks are retained
     # by the STW sweep. Release the list lock before the revival takes alloc.
-    private def dormant_chunk_for_allocation(index : Int32, nursery : Bool,
-                                             atomic : Bool? = nil) : ChunkHeader*?
+    private def dormant_chunk_for_allocation(index : Int32, nursery : Bool) : ChunkHeader*?
       each_chunk_for_allocation do |chunk|
         next if ChunkHeader.large?(chunk)
         next unless ChunkHeader.dormant?(chunk)
         next unless chunk.value.size_class == index.to_u32
         next unless ChunkHeader.nursery?(chunk) == nursery
-        next if !atomic.nil? && ChunkHeader.atomic?(chunk) != atomic
         return chunk
       end
       nil

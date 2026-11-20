@@ -1,36 +1,6 @@
-# How does a refill's chunk-list walk scale with the number of chunks?
-#
-# `tasks/todo.md` has carried this since the bitmap allocator landed:
-#
-#   > `bitmap_take_pool_chunk` walks every chunk of the class per refill:
-#   > O(chunks)
-#
-# The code no longer reads that way — the walk builds a sorted index of
-# candidate addresses once per *capacity version* and later refills are served
-# from that index — so the question is whether the note is stale or whether
-# versions change often enough that the walk is effectively per-refill. That is
-# a counting question rather than a timing one, which makes it answerable on a
-# loaded host: `bitmap_pool_searches` counts rebuilds, `size_class_chunk_count`
-# says how long one walk is, and the cost that matters is
-#
-#   rebuilds x chunks / allocations
-#
-# An absolute number cannot answer it. At 36 chunks the steady state measured
-# 0.019 chunk visits per allocation, which is nothing; the same rebuild *rate*
-# over 10 000 chunks would be 5 visits per allocation, which is not. So this
-# measures the slope: phases with progressively larger live sets, and whether
-# the rebuild rate falls as the chunk count rises.
-#
-#   bin/pool_refill_cost              # live set grows across phases
-#   bin/pool_refill_cost --churn      # and is dropped every round, which is
-#                                     # what invalidates the index
-#   GCRY_DISABLE_POOL_INDEX=1 bin/pool_refill_cost --disabled
-#                                     # every refill walks; rebuilds exceed
-#                                     # the per-version floor
-#
-# Until 2026-09-20 the only way this gate came out red was a hand edit of
-# that floor. `--disabled` requires the walk to be paid per refill.
-# Dropping the knob reddens the gate rather than hiding it.
+# Count class-local chunk visits as the small-object live set grows. The
+# disabled arm forces discovery on every refill to check the rebuild gate.
+# Run all three arms with `make pool-refill-cost`.
 
 require "../src/gcry"
 
@@ -68,6 +38,7 @@ PHASES.each do |keep|
   (keep * PER_ROUND).times { live << Array(UInt8).new(ALLOC_BYTES, 1_u8) }
   GC.collect
   before = heap.bitmap_pool_searches
+  visits_before = heap.bitmap_pool_chunk_visits
   allocs = 0_u64
   ROUNDS.times do
     PER_ROUND.times do
@@ -80,7 +51,7 @@ PHASES.each do |keep|
   end
   rebuilds = heap.bitmap_pool_searches - before
   chunks = heap.size_class_chunk_count
-  visits = allocs > 0 ? (rebuilds * chunks).to_f / allocs : 0.0
+  visits = allocs > 0 ? (heap.bitmap_pool_chunk_visits - visits_before).to_f / allocs : 0.0
   results << Phase.new(chunks, allocs, rebuilds, visits)
   puts "  #{keep.to_s.rjust(11)}   #{chunks.to_s.rjust(6)}   #{allocs.to_s.rjust(11)}" \
        "   #{rebuilds.to_s.rjust(8)}   #{(rebuilds * 1000.0 / allocs).round(2).to_s.rjust(13)}" \
@@ -106,47 +77,10 @@ cost_growth = first.visits > 0 ? last.visits / first.visits : Float64::INFINITY
 puts "chunks grew #{growth.round(2)}x across the phases; chunk visits per allocation grew " \
      "#{cost_growth.round(2)}x."
 
-# The axis that decides this. The rebuild rate per *allocation* is constant, so
-# the per-allocation cost has to grow with the chunk count — that is arithmetic,
-# not a defect. What says whether it is a defect is the rebuild count per
-# *collection*: the index is keyed on a capacity version that each sweep bumps,
-# so one rebuild per active class slot per collection is the floor any
-# per-version index pays, and anything above that is the walk being paid again
-# and again.
 rebuilds_per_collection = results.sum(&.rebuilds).to_f / (PHASES.size * ROUNDS)
-# And what it is worth comparing against: the sweep walks every *block* of every
-# chunk in the same collection, so one visit per chunk is 1/blocks-per-chunk of
-# a sweep pass.
-blocks_per_chunk = (heap.small_chunk_bytes / ALLOC_BYTES).to_f
-share = rebuilds_per_collection / blocks_per_chunk
-puts "#{rebuilds_per_collection.round(2)} rebuild(s) per collection, each one chunk visit per chunk:"
-puts "#{(share * 100).round(3)}% of the sweep's own walk over the same chunks " \
-     "(#{blocks_per_chunk.round} blocks per chunk at this size)."
-puts ""
-
-# Two active slots on this workload — the size class, and the atomic variant of
-# it — so anything up to a handful is the floor rather than a finding.
-if disabled
-  if rebuilds_per_collection <= 8.0
-    puts "FAIL #{rebuilds_per_collection.round(2)} rebuilds per collection is still the per-version"
-    puts "floor — GCRY_DISABLE_POOL_INDEX no longer forces a walk per refill, so the only way"
-    puts "this gate can fail is a hand edit of that floor again."
-    exit 1
-  end
-  puts "ok — the index was skipped, so the walk is paid per refill:"
-  puts "#{rebuilds_per_collection.round(2)} rebuilds per collection, which is the O(chunks) shape"
-  puts "the note described and the floor a hand edit of bitmap_take_pool_chunk used to restore."
-  exit 0
+puts "#{rebuilds_per_collection.round(2)} rebuilds per collection."
+if disabled ? rebuilds_per_collection <= 8.0 : rebuilds_per_collection > 8.0
+  puts "FAIL: unexpected rebuild rate with pool index #{disabled ? "disabled" : "enabled"}"
+  exit 1
 end
-if rebuilds_per_collection <= 8.0
-  puts "ok — the walk is paid once per capacity version, which each sweep bumps, not once per"
-  puts "refill: #{rebuilds_per_collection.round(2)} rebuilds per collection however many chunks there are. The cost per"
-  puts "allocation does grow with the chunk count, and that is the arithmetic of a constant"
-  puts "rebuild rate rather than a regression — at #{last.chunks} chunks it is #{last.visits.round(3)} chunk visits per"
-  puts "allocation, a fraction of a percent of what the sweep walks in the same collection."
-  exit 0
-end
-puts "FAIL #{rebuilds_per_collection.round(2)} rebuilds per collection is more than one per active class slot, so the"
-puts "index is being invalidated inside a collection and its walk paid repeatedly. Caching"
-puts "it harder will not help; the sweep has to hand the allocator the chunks with room."
-exit 1
+puts "ok"

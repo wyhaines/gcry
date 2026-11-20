@@ -1,6 +1,25 @@
 require "./spec_helper"
 
 class Gcry::Heap
+  def check_pool_membership_for_spec : Nil
+    expected = [] of UInt64
+    each_chunk do |chunk|
+      next if Gcry::ChunkHeader.large?(chunk) || Gcry::ChunkHeader.nursery?(chunk) || Gcry::ChunkHeader.reserve?(chunk)
+      expected << chunk.address
+    end
+    found = [] of UInt64
+    POOL_SLOTS.times do |slot|
+      prev = Pointer(Gcry::ChunkHeader).null
+      each_bitmap_pool_member(slot) do |chunk|
+        bitmap_capacity_slot(chunk).should eq(slot)
+        bitmap_pool_links(chunk).value.previous.should eq(prev)
+        found << chunk.address
+        prev = chunk
+      end
+    end
+    found.sort!.should eq(expected.sort!)
+  end
+
   def pool_index_at_stw_for_spec(address : UInt64) : UInt64
     @index_lock.lock
     @world_stopped = true
@@ -47,6 +66,27 @@ describe "bitmap pool capacity search" do
     end
   end
 
+  it "skips unrelated mappings and rechecks one changed chunk directly" do
+    heap = Gcry::Heap.new
+    begin
+      heap.bitmap_alloc = true
+      heap.nursery_enabled = false
+      heap.blacklist_enabled = false
+      heap.gc_threshold = UInt64::MAX
+      128.times { heap.malloc(40 * 1024) }
+      200.times { heap.malloc_atomic(8192) }
+      visits = heap.bitmap_pool_chunk_visits
+      first = heap.malloc(8192)
+      199.times { heap.malloc(8192) }
+      heap.bitmap_pool_chunk_visits.should eq(visits)
+      heap.free(first)
+      Array.new(32) { heap.malloc(8192) }.should contain(first)
+      heap.bitmap_pool_chunk_visits.should eq(visits)
+    ensure
+      heap.destroy
+    end
+  end
+
   it "finds an explicitly freed block after a cached empty search" do
     heap = Gcry::Heap.new
     begin
@@ -81,6 +121,33 @@ describe "bitmap pool capacity search" do
       199.times { heap.malloc(8192) }
       heap.heap_size.should eq(size)
       heap.live?(keep).should be_true
+    ensure
+      heap.destroy
+    end
+  end
+
+  it "keeps class membership and back-links across release and reuse" do
+    heap = Gcry::Heap.new
+    begin
+      heap.bitmap_alloc = true
+      heap.nursery_enabled = false
+      heap.gc_threshold = UInt64::MAX
+      heap.blacklist_enabled = false
+      heap.release_empty_chunks = true
+      heap.empty_chunk_retain = 0_u64
+      heap.empty_chunk_warm_retain = 0_u64
+      2.times do
+        100.times do
+          heap.malloc(8192)
+          heap.malloc_atomic(4096)
+        end
+        heap.check_pool_membership_for_spec
+        2.times do
+          heap.collect(scan_stack: false)
+          heap.check_pool_membership_for_spec
+        end
+      end
+      heap.unmapped_bytes.should be > 0
     ensure
       heap.destroy
     end
