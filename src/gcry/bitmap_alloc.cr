@@ -78,14 +78,21 @@ module Gcry
     end
   end
 
-  # Stored immediately before the payload area of regular bitmap chunks.
-  struct BitmapPoolLinks
-    property previous : ChunkHeader*
-    property following : ChunkHeader*
+  # Regular small chunks of one size and pointer kind. The live list lock
+  # protects membership. The low 16 bits of the position live in the chunk
+  # flags, so removal checks one entry per 65536 chunks of this class.
+  struct BitmapClassDirectory
+    MIN_CAPACITY = 8
 
-    def initialize(@previous, @following)
-    end
+    property entries = Pointer(ChunkHeader*).null
+    property count = 0
+    property capacity = 0
+    property fallback = false
   end
+
+  # Keep small bursts exact; overflow falls back to one class-local rebuild.
+  POOL_CHANGES = 4
+  alias PoolChanges = StaticArray(UInt64, POOL_CHANGES)
 
   # Reusable-capacity index for one (class, kind), owned by its class lock.
   # Store addresses, not dereferenceable cached ChunkHeader pointers: mappings
@@ -96,7 +103,8 @@ module Gcry
     property capacity : Int32 = 0
     property count : Int32 = 0
     property next_index : Int32 = 0
-    property extra_address : UInt64 = 0_u64
+    property extras = StaticArray(UInt64, POOL_CHANGES).new(0_u64)
+    property extra_count = 0
     property probe_dormant : Bool = false
     property valid : Bool = false
     property blacklist_enabled : Bool = false
@@ -364,13 +372,13 @@ module Gcry
     # two clears — the control arm of regression 91 (`bitmap_free_block`).
     property bitmap_free_claim_guard : Bool = true
 
-    # Each slot records no change (0), one changed mapping base, or changes
-    # to several mappings. A stopped-world sweep can interrupt a publisher.
+    # Each slot records a bounded set of changed mapping bases. A stopped-
+    # world sweep can interrupt a publisher or consumer between entries.
     # The consumer drains the word before looking: a publication during its
     # search survives for the next refill.
     MULTIPLE_POOL_CHUNKS = UInt64::MAX
-    @bitmap_changed_chunks = uninitialized StaticArray(UInt64, POOL_SLOTS)
-    @bitmap_class_heads = uninitialized StaticArray(ChunkHeader*, POOL_SLOTS)
+    @bitmap_changed_chunks = uninitialized StaticArray(PoolChanges, POOL_SLOTS)
+    @bitmap_directories = uninitialized StaticArray(BitmapClassDirectory, POOL_SLOTS)
     @bitmap_pool_indexes = uninitialized StaticArray(BitmapPoolIndex, POOL_SLOTS)
     @bitmap_visit_counts = uninitialized StaticArray(UInt64, POOL_SLOTS)
     @bitmap_search_counts = uninitialized StaticArray(UInt64, POOL_SLOTS)
@@ -406,21 +414,54 @@ module Gcry
     end
 
     private def bitmap_publish_capacity(slot : Int32, address : UInt64) : Nil
-      field = @bitmap_changed_chunks.to_unsafe + slot
-      old = Atomic::Ops.load(field, :monotonic, false)
-      loop do
-        value = (old == 0 || old == address) ? address : MULTIPLE_POOL_CHUNKS
-        old, ok = Atomic::Ops.cmpxchg(field, old, value, :release, :monotonic)
-        return if ok
+      fields = (@bitmap_changed_chunks.to_unsafe + slot).as(UInt64*)
+      POOL_CHANGES.times do |i|
+        field = fields + i
+        old = Atomic::Ops.load(field, :monotonic, false)
+        while old == 0 || old == address || old == MULTIPLE_POOL_CHUNKS
+          value = old == MULTIPLE_POOL_CHUNKS ? old : address
+          old, ok = Atomic::Ops.cmpxchg(field, old, value, :release, :monotonic)
+          return if ok
+        end
+      end
+      Atomic::Ops.atomicrmw(:xchg, fields, MULTIPLE_POOL_CHUNKS, :release, false)
+    end
+
+    # A publisher needs only an address, even when a stop has unmapped its
+    # former chunk. Drain before discovery so a concurrent publication stays
+    # visible. The smallest pending address is last, beside the sorted cache.
+    private def bitmap_drain_changes(pool : BitmapPoolIndex*, slot : Int32) : Nil
+      fields = (@bitmap_changed_chunks.to_unsafe + slot).as(UInt64*)
+      extras = pointerof(pool.value.@extras).as(UInt64*)
+      count = pool.value.extra_count
+      POOL_CHANGES.times do |i|
+        field = fields + i
+        next if Atomic::Ops.load(field, :acquire, false) == 0
+        changed = Atomic::Ops.atomicrmw(:xchg, field, 0_u64, :acquire, false)
+        next if changed == 0 || !pool.value.valid
+        if changed == MULTIPLE_POOL_CHUNKS
+          pool.value.valid = false
+        elsif !extras.to_slice(count).includes?(changed)
+          if count == POOL_CHANGES
+            pool.value.valid = false
+          else
+            extras[count] = changed
+            count += 1
+          end
+        end
+      end
+      if count != pool.value.extra_count
+        extras.to_slice(count).sort! { |a, b| b <=> a } if pool.value.valid && count > 1
+        pool.value.extra_count = count
       end
     end
 
     protected def bitmap_alloc_init : Nil
       @cursor_sets = StaticArray(CursorSet*, MAX_CURSOR_SETS).new(Pointer(CursorSet).null)
       @cursor_set_count = 0
-      @bitmap_class_heads = StaticArray(ChunkHeader*, POOL_SLOTS).new(Pointer(ChunkHeader).null)
+      @bitmap_directories = StaticArray(BitmapClassDirectory, POOL_SLOTS).new(BitmapClassDirectory.new)
       @bitmap_pool_indexes = StaticArray(BitmapPoolIndex, POOL_SLOTS).new(BitmapPoolIndex.new)
-      @bitmap_changed_chunks = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
+      @bitmap_changed_chunks = StaticArray(PoolChanges, POOL_SLOTS).new(PoolChanges.new(0_u64))
       @bitmap_visit_counts = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
       @bitmap_search_counts = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
       @bitmap_search_skip_counts = StaticArray(UInt64, POOL_SLOTS).new(0_u64)
@@ -603,6 +644,8 @@ module Gcry
     protected def destroy_cursor_sets : Nil
       i = 0
       while i < POOL_SLOTS
+        dir = @bitmap_directories.to_unsafe + i
+        LibC.free(dir.value.entries.as(Void*))
         pool = @bitmap_pool_indexes.to_unsafe + i
         unless pool.value.addresses.null?
           Gcry.os_unmap(pool.value.addresses.as(Void*), pool.value.capacity.to_u64 * 8)
@@ -1379,75 +1422,139 @@ module Gcry
       end
     end
 
-    # Only normal bitmap chunks participate. Links occupy the last two words
-    # before data_start, outside the bitmaps and the discardable data pages.
-    # Membership follows the live chunk list under the same lock. A sweep
-    # can reorder that list without changing a pool.
     private def bitmap_pool_member?(chunk : ChunkHeader*) : Bool
       bitmap_alloc_chunk?(chunk) && chunk.value.bitmap_words != 0 && !ChunkHeader.reserve?(chunk)
     end
 
-    @[AlwaysInline]
-    private def bitmap_pool_links(chunk : ChunkHeader*) : BitmapPoolLinks*
-      ChunkHeader.data_start(chunk).as(BitmapPoolLinks*) - 1
+    # Allocate and copy before publishing the new pointer. If a mutator is
+    # stopped during growth, the collector can enumerate the old count through
+    # either pointer. No reader holds an entry buffer outside the list lock.
+    private def bitmap_directory_resize(dir : BitmapClassDirectory*, capacity : Int32) : Bool
+      old = dir.value.entries
+      entries = Pointer(ChunkHeader*).null
+      if capacity > 0
+        entries = LibC.malloc(LibC::SizeT.new(capacity.to_u64 * sizeof(ChunkHeader*))).as(ChunkHeader**)
+        return false if entries.null?
+        entries.copy_from(old, dir.value.count) unless dir.value.count == 0
+      end
+      Atomic::Ops.store(pointerof(dir.value.@entries), entries, :release, true)
+      dir.value.capacity = capacity
+      LibC.free(old.as(Void*))
+      true
     end
 
     private def bitmap_pool_link(chunk : ChunkHeader*) : Nil
-      slot = bitmap_capacity_slot(chunk)
-      head = @bitmap_class_heads[slot]
-      links = bitmap_pool_links(chunk)
-      links.value = BitmapPoolLinks.new(Pointer(ChunkHeader).null, head)
-      bitmap_pool_links(head).value.previous = chunk if head
-      Atomic::Ops.store(@bitmap_class_heads.to_unsafe + slot, chunk, :release, true)
+      dir = @bitmap_directories.to_unsafe + bitmap_capacity_slot(chunk)
+      count = dir.value.count
+      if dir.value.fallback
+        dir.value.count = count + 1
+        return
+      end
+      if count == dir.value.capacity
+        if count >= Int32::MAX // 2 || !bitmap_directory_resize(dir, Math.max(BitmapClassDirectory::MIN_CAPACITY, count * 2))
+          # Optional metadata OOM: the original live list still owns every
+          # mapping. Leave this slot searchable even if its directory is short.
+          dir.value.fallback = true
+          Atomic::Ops.fence(:sequentially_consistent, true)
+          bitmap_directory_resize(dir, 0)
+          dir.value.count = count + 1
+          return
+        end
+      end
+      ChunkHeader.set_pool_position(chunk, count)
+      dir.value.entries[count] = chunk
+      Atomic::Ops.store(pointerof(dir.value.@count), count + 1, :release, true)
+    end
+
+    private def bitmap_directory_position(dir : BitmapClassDirectory*, chunk : ChunkHeader*) : Int32
+      entries = dir.value.entries
+      at = ChunkHeader.pool_position(chunk).to_i64
+      while at < dir.value.count
+        return at.to_i32 if entries[at] == chunk
+        at += ChunkHeader::POOL_POSITION_STRIDE
+      end
+      -1
+    end
+
+    private def bitmap_pool_linked?(slot : Int32, chunk : ChunkHeader*) : Bool
+      dir = @bitmap_directories.to_unsafe + slot
+      if dir.value.fallback
+        each_chunk { |member| return true if member == chunk }
+        return false
+      end
+      bitmap_directory_position(dir, chunk) >= 0
     end
 
     private def bitmap_pool_unlink(chunk : ChunkHeader*) : Nil
-      links = bitmap_pool_links(chunk)
-      prev, following = links.value.previous, links.value.following
-      if prev
-        bitmap_pool_links(prev).value.following = following
-      else
-        @bitmap_class_heads[bitmap_capacity_slot(chunk)] = following
+      dir = @bitmap_directories.to_unsafe + bitmap_capacity_slot(chunk)
+      if dir.value.fallback
+        remaining = dir.value.count - 1
+        dir.value.count = remaining
+        # Once the last unindexed mapping leaves, growth can be retried.
+        dir.value.fallback = false if remaining == 0
+        return
       end
-      bitmap_pool_links(following).value.previous = prev if following
-      links.value.previous = Pointer(ChunkHeader).null
+      at = bitmap_directory_position(dir, chunk)
+      return if at < 0
+      last = dir.value.count - 1
+      if at != last
+        entries = dir.value.entries
+        moved = entries[last]
+        entries[at] = moved
+        ChunkHeader.set_pool_position(moved, at)
+      end
+      Atomic::Ops.store(pointerof(dir.value.@count), last, :release, true)
+    end
+
+    # After queued releases, with the world running and the list lock held.
+    private def bitmap_trim_directories : Nil
+      @bitmap_directories.size.times do |slot|
+        dir = @bitmap_directories.to_unsafe + slot
+        next if dir.value.entries.null?
+        count = dir.value.count
+        if count == 0
+          bitmap_directory_resize(dir, 0)
+        elsif dir.value.capacity > BitmapClassDirectory::MIN_CAPACITY && count <= dir.value.capacity // 4
+          bitmap_directory_resize(dir, Math.max(BitmapClassDirectory::MIN_CAPACITY, Math.pw2ceil(count * 2)))
+        end
+      end
     end
 
     private def each_bitmap_pool_member(slot : Int32, &)
       visited = 0_u64
       begin
-        chunk = @bitmap_class_heads[slot]
-        while chunk
-          visited &+= 1
-          yield chunk
-          chunk = bitmap_pool_links(chunk).value.following
+        dir = @bitmap_directories.to_unsafe + slot
+        if dir.value.fallback
+          each_chunk do |chunk|
+            visited &+= 1
+            yield chunk if bitmap_pool_member?(chunk) && bitmap_capacity_slot(chunk) == slot
+          end
+        else
+          entries = dir.value.entries
+          dir.value.count.times do |at|
+            visited &+= 1
+            yield entries[at]
+          end
         end
       ensure
         @bitmap_visit_counts[slot] &+= visited
       end
     end
 
-    # Cache eligible addresses in ascending order. A rebuild visits only the
-    # requested size and pointer kind, including on optional metadata OOM.
+    # Cache eligible addresses in ascending order. Rebuild from this class's
+    # directory; the live list is the fallback if the directory ran out of memory.
     # Return a CURSOR-owned chunk: the STW sweep ignores the caller's class
     # lock, so ownership must survive the handoff to bitmap_refill_pool.
     protected def bitmap_take_pool_chunk(index : Int32, payload : UInt32,
                                          atomic : Bool) : ChunkHeader*
       slot = atomic ? index + SIZE_CLASS_COUNT : index
-      field = @bitmap_changed_chunks.to_unsafe + slot
-      changed = Atomic::Ops.load(field, :acquire, false)
-      changed = Atomic::Ops.atomicrmw(:xchg, field, 0_u64, :acquire, false) unless changed == 0
       pool = @bitmap_pool_indexes.to_unsafe + slot
       pool.value.valid = false if @pool_index_disabled || pool.value.blacklist_enabled != @blacklist_enabled
-      if changed != 0
-        if changed == MULTIPLE_POOL_CHUNKS || (pool.value.extra_address != 0 && pool.value.extra_address != changed)
-          pool.value.valid = false
-        else
-          pool.value.extra_address = changed
-        end
-      end
+      bitmap_drain_changes(pool, slot)
+      extras = pointerof(pool.value.@extras).as(UInt64*)
       unless pool.value.valid
-        pool.value.extra_address = 0_u64
+        extras.clear(pool.value.extra_count)
+        pool.value.extra_count = 0
         pool.value.probe_dormant = false
         pool.value.count = 0
         pool.value.next_index = 0
@@ -1489,10 +1596,12 @@ module Gcry
 
       loop do
         at = pool.value.next_index
-        extra = pool.value.extra_address
+        n = pool.value.extra_count
+        extra = n > 0 ? extras[n - 1] : 0_u64
         if extra != 0 && (at == pool.value.count || extra <= pool.value.addresses[at])
           address = extra
-          pool.value.extra_address = 0_u64
+          extras[n - 1] = 0_u64
+          pool.value.extra_count = n - 1
         elsif at < pool.value.count
           address = pool.value.addresses[at]
           pool.value.next_index = at + 1
@@ -1510,7 +1619,7 @@ module Gcry
             if chunk.address == address && bitmap_pool_candidate?(chunk, index, atomic)
               # A capacity notification can outlive detachment for release.
               # Only live list members may enter the cache through this path.
-              next if address == extra && @bitmap_class_heads[slot] != chunk && bitmap_pool_links(chunk).value.previous.null?
+              next if address == extra && !bitmap_pool_linked?(slot, chunk)
               if hook = @pool_take_hook
                 hook.call(chunk)
               end

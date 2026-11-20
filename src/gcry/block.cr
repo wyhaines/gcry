@@ -680,6 +680,27 @@ module Gcry
       end
     end
 
+    # High flag bits in regular small chunks are the low 16 bits of their
+    # position in the class directory. Large chunks use this space for their
+    # grow extent. The address check handles both recycled keys and heaps with
+    # more than 65536 chunks in one class.
+    POOL_POSITION_STRIDE = 65_536
+
+    def self.pool_position(chunk : ChunkHeader*) : Int32
+      (Atomic::Ops.load(pointerof(chunk.value.@flags), :monotonic, false) >> 16).to_i32
+    end
+
+    def self.set_pool_position(chunk : ChunkHeader*, index : Int32) : Nil
+      field = pointerof(chunk.value.@flags)
+      old = Atomic::Ops.load(field, :monotonic, false)
+      bits = index.to_u32 << 16
+      loop do
+        value = (old & 0xFFFF_u32) | bits
+        old, ok = Atomic::Ops.cmpxchg(field, old, value, :release, :monotonic)
+        return if ok
+      end
+    end
+
     # Link writers hold the list lock (or STW); flag writers hold class locks.
     # Never copy the flags back when changing the list.
     def self.set_next(chunk : ChunkHeader*, successor : ChunkHeader*) : Nil

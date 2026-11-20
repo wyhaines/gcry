@@ -1071,6 +1071,7 @@ module Gcry
         keep = nxt
       end
 
+      bitmap_trim_directories if @bitmap_alloc
       flush_release_runs(release_head)
     end
 

@@ -4030,7 +4030,7 @@ module Gcry
       if @bitmap_marks && size_class != UInt32::MAX &&
          size_class < SIZE_CLASS_COUNT.to_u32
         bitmap_words, data_offset =
-          Heap.chunk_geometry(@block_bytes[size_class.to_i32], bytes, true, pool_links: pool_member)
+          Heap.chunk_geometry(@block_bytes[size_class.to_i32], bytes, true)
       end
 
       # Prepend and index-insert under the **one** lock that guards `@chunks`.
