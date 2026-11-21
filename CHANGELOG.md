@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Small bitmap allocations refill from chunks of the requested size class and
+  pointer kind. Up to four chunks that gain capacity can be reused directly.
+- When gcry is the process collector, Crystal’s 32 KiB buffered IO default
+  becomes 32,767 bytes. This leaves room for the allocator’s extra byte inside the
+  32 KiB class. Explicit buffer sizes still work. On Linux with 128 KiB chunks
+  and 4 KiB pages, three buffers share a chunk. At full occupancy that costs
+  about 42.7 KiB of mapped space per buffer, up from 36 KiB.
+- Large free lists cache their tail to speed up repeated appends. Finalizer
+  and weak-link indexes reuse their capacity after many entries are deleted.
+
 ## [0.40.0] - 2026-11-11
 
 > **0.39.0 and earlier have memory-safety bugs in the opt-in incremental and
