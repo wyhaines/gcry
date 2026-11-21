@@ -352,10 +352,19 @@ describe "Regression: an in-stop sweep writes no freelist a frozen thread is ins
         # The control arms hand blocks out wrongly on purpose.
         env = {"GCRY_FROZEN_FREELIST_CHILD" => "#{window}-#{arm}"} of String => String?
         env["GCRY_DEBUG_INVARIANTS"] = nil if arm == "control"
-        status = Process.run(Process.executable_path.not_nil!,
+        child = Process.new(Process.executable_path.not_nil!,
           ["-e", "stop-sweep-frozen-freelist-holder child #{window} #{arm}"],
           env: env, output: captured, error: captured)
-        fail "child #{status.inspect}:\n#{captured}" unless status.success?
+        exited = Channel(Process::Status).new(1)
+        spawn { exited.send(child.wait) }
+        select
+        when status = exited.receive
+          fail "child #{status.inspect}:\n#{captured}" unless status.success?
+        when timeout(60.seconds)
+          child.terminate(graceful: false)
+          exited.receive
+          fail "#{window} #{arm} child hung for 60 seconds\n#{captured}"
+        end
         if window == "exclusion" && arm == "control"
           # Or skipped: no batch path on this heap.
           text = captured.to_s
@@ -454,9 +463,9 @@ describe "Regression: an in-stop sweep writes no freelist a frozen thread is ins
     heap.small_exclusion_batch_first = true
     finished = freelist84_exclusion_window(heap)
     finished.should be_false
-    STDOUT.puts "freelist84: the release and the refill deadlocked"
-    STDOUT.flush
-    # Two threads spin on each other's locks for good.
-    LibC._exit(0)
+    # Buffered IO could allocate while the two threads hold the batch locks.
+    message = "freelist84: the release and the refill deadlocked\n"
+    written = Gcry::OS.write(1, message.to_unsafe, LibC::SizeT.new(message.bytesize))
+    LibC._exit(written == message.bytesize ? 0 : 1)
   end
 end
