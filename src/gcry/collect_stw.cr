@@ -1177,6 +1177,9 @@ module Gcry
       @gc_lock = Crystal::RWLock.new
       @thread_register_gate = Crystal::RWLock.new
       @alloc_lock = Crystal::SpinLock.new
+      # A vanished thread may have linked a new tail before updating the hint.
+      # The first append in the child can rediscover it from the bucket head.
+      @large_freelists.each { |head| large_cache_tail_slot(head).value = Pointer(Void).null if head }
       init_freelist_locks
       @roots_lock = RootsLock.new
       @index_lock = Crystal::SpinLock.new

@@ -1,5 +1,15 @@
 require "./spec_helper"
 
+class Gcry::Heap
+  def large_tail_hint_for_spec(head : Void*) : Void*
+    large_cache_tail_slot(head).value
+  end
+
+  def release_moved_for_spec : Nil
+    release_moved_large
+  end
+end
+
 module ReallocMoveSpec
   # Out of line, so the referents' addresses do not stay in the spec's frame
   # and the moved buffer is what keeps them alive.
@@ -359,6 +369,47 @@ describe Gcry::Heap do
   end
 
   {% if flag?(:linux) %}
+    it "repairs the head's hint when a best-fit recycle takes the tail" do
+      heap = Gcry::Heap.new
+      begin
+        heap.gc_threshold = UInt64::MAX
+        heap.large_recycle = true
+        heap.large_recycle_budget = UInt64::MAX
+        page = Gcry::Platform.host_page_size
+        head = heap.malloc(22 * page)
+        tail = heap.malloc(20 * page)
+        heap.free(head)
+        heap.free(tail)
+        heap.large_tail_hint_for_spec(head).should eq(tail)
+        heap.malloc(19 * page)
+        heap.large_recycles.should eq(1)
+        heap.large_tail_hint_for_spec(head).should eq(head)
+      ensure
+        heap.destroy
+      end
+    end
+
+    it "repairs the head's hint when releasing a tail whose pages moved" do
+      heap = Gcry::Heap.new
+      begin
+        heap.gc_threshold = UInt64::MAX
+        heap.realloc_in_place = false
+        heap.realloc_move = true
+        head = heap.malloc(400_000)
+        tail = heap.malloc(400_000)
+        heap.realloc(tail, 800_000)
+        heap.realloc_moves.should eq(1)
+        heap.free(head)
+        heap.free(tail)
+        heap.large_tail_hint_for_spec(head).should eq(tail)
+        heap.release_moved_for_spec
+        heap.is_heap_ptr(tail).should be_false
+        heap.large_tail_hint_for_spec(head).should eq(head)
+      ensure
+        heap.destroy
+      end
+    end
+
     # Recycling hands a cached chunk's pages to a new block at an address the
     # kernel picks: a stale pointer to the dead block must not name the new
     # one (that kept Revcomp's 65 MB strings alive), the new block reads
