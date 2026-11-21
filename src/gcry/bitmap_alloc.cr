@@ -103,11 +103,20 @@ module Gcry
     property capacity : Int32 = 0
     property count : Int32 = 0
     property next_index : Int32 = 0
-    property extras = StaticArray(UInt64, POOL_CHANGES).new(0_u64)
-    property extra_count = 0
+    property extra_count = 0_u8
     property probe_dormant : Bool = false
     property valid : Bool = false
     property blacklist_enabled : Bool = false
+
+    # Reserve the last four words of the existing mapping for drained changes.
+    # Inactive slots then need no extra storage inside every Heap object.
+    def candidate_capacity : Int32
+      capacity == 0 ? 0 : capacity - POOL_CHANGES
+    end
+
+    def extras : UInt64*
+      addresses + candidate_capacity
+    end
   end
 
   # One thread's cursors for one heap, `LibC.malloc`ed and zeroed. Reached
@@ -374,8 +383,8 @@ module Gcry
 
     # Each slot records a bounded set of changed mapping bases. A stopped-
     # world sweep can interrupt a publisher or consumer between entries.
-    # The consumer drains the word before looking: a publication during its
-    # search survives for the next refill.
+    # A refill drains the pending addresses before searching so publications
+    # during discovery survive for the next refill.
     MULTIPLE_POOL_CHUNKS = UInt64::MAX
     @bitmap_changed_chunks = uninitialized StaticArray(PoolChanges, POOL_SLOTS)
     @bitmap_directories = uninitialized StaticArray(BitmapClassDirectory, POOL_SLOTS)
@@ -432,8 +441,8 @@ module Gcry
     # visible. The smallest pending address is last, beside the sorted cache.
     private def bitmap_drain_changes(pool : BitmapPoolIndex*, slot : Int32) : Nil
       fields = (@bitmap_changed_chunks.to_unsafe + slot).as(UInt64*)
-      extras = pointerof(pool.value.@extras).as(UInt64*)
-      count = pool.value.extra_count
+      extras = pool.value.extras
+      count = pool.value.extra_count.to_i
       POOL_CHANGES.times do |i|
         field = fields + i
         next if Atomic::Ops.load(field, :acquire, false) == 0
@@ -452,7 +461,7 @@ module Gcry
       end
       if count != pool.value.extra_count
         extras.to_slice(count).sort! { |a, b| b <=> a } if pool.value.valid && count > 1
-        pool.value.extra_count = count
+        pool.value.extra_count = count.to_u8
       end
     end
 
@@ -1506,7 +1515,7 @@ module Gcry
       Atomic::Ops.store(pointerof(dir.value.@count), last, :release, true)
     end
 
-    # After queued releases, with the world running and the list lock held.
+    # After relinking refused releases, with the world running and the list lock held.
     private def bitmap_trim_directories : Nil
       @bitmap_directories.size.times do |slot|
         dir = @bitmap_directories.to_unsafe + slot
@@ -1551,10 +1560,8 @@ module Gcry
       pool = @bitmap_pool_indexes.to_unsafe + slot
       pool.value.valid = false if @pool_index_disabled || pool.value.blacklist_enabled != @blacklist_enabled
       bitmap_drain_changes(pool, slot)
-      extras = pointerof(pool.value.@extras).as(UInt64*)
       unless pool.value.valid
-        extras.clear(pool.value.extra_count)
-        pool.value.extra_count = 0
+        pool.value.extra_count = 0_u8
         pool.value.probe_dormant = false
         pool.value.count = 0
         pool.value.next_index = 0
@@ -1564,6 +1571,7 @@ module Gcry
         # an mmap under that spinlock would stall every `map_chunk` and
         # `unlink_chunk` on other threads for the syscall.
         bitmap_pool_grow(pool, 1) if pool.value.capacity == 0
+        capacity = pool.value.candidate_capacity
         best = Pointer(ChunkHeader).null
         candidates = 0
         with_chunk_list_for_allocation do
@@ -1572,14 +1580,14 @@ module Gcry
             next unless bitmap_pool_candidate?(chunk, index, atomic)
             best = chunk if best.null? || chunk.address < best.address
             # Overflow is only counted here; the walk never allocates.
-            pool.value.addresses[candidates] = chunk.address if candidates < pool.value.capacity
+            pool.value.addresses[candidates] = chunk.address if candidates < capacity
             candidates += 1
           end
           # The overflow fallback keeps this pointer across the unlocked
           # metadata grow below. Pin it before releasing list protection.
-          ChunkHeader.set_cursor(best, true) if candidates > pool.value.capacity
+          ChunkHeader.set_cursor(best, true) if candidates > capacity
         end
-        if candidates > pool.value.capacity
+        if candidates > capacity
           # Grow now, outside the walk, so the next refill indexes fully. This
           # one falls back to the lowest-address search result. OOM in optional
           # metadata must not raise under the class lock: a failed grow leaves
@@ -1591,9 +1599,11 @@ module Gcry
         pool.value.count = candidates
         pool.value.addresses.to_slice(candidates).sort! if candidates > 1
         pool.value.blacklist_enabled = @blacklist_enabled
-        pool.value.valid = true
+        # Without a mapping, the next refill must rediscover any capacity.
+        pool.value.valid = capacity > 0
       end
 
+      extras = pool.value.extras
       loop do
         at = pool.value.next_index
         n = pool.value.extra_count
@@ -1617,9 +1627,9 @@ module Gcry
           if chunk = bitmap_indexed_chunk(address)
             pool.value.probe_dormant = true if ChunkHeader.dormant?(chunk)
             if chunk.address == address && bitmap_pool_candidate?(chunk, index, atomic)
-              # A capacity notification can outlive detachment for release.
-              # Only live list members may enter the cache through this path.
-              next if address == extra && !bitmap_pool_linked?(slot, chunk)
+              # Both the cache and the notifications can outlive detachment.
+              # The address index still includes chunks awaiting the flush.
+              next unless bitmap_pool_linked?(slot, chunk)
               if hook = @pool_take_hook
                 hook.call(chunk)
               end
@@ -1712,7 +1722,7 @@ module Gcry
     # buffer in place.
     private def bitmap_pool_grow(pool : BitmapPoolIndex*, needed : Int32) : Bool
       capacity = pool.value.capacity == 0 ? 512 : pool.value.capacity
-      while capacity < needed
+      while capacity - POOL_CHANGES < needed
         return false if capacity > Int32::MAX // 2
         capacity *= 2
       end

@@ -17,7 +17,7 @@ heap = Gcry.default_heap.not_nil!
 churn = ARGV.includes?("--churn")
 disabled = ARGV.includes?("--disabled")
 if disabled && !heap.pool_index_disabled
-  STDERR.puts "--disabled needs GCRY_DISABLE_POOL_INDEX=1: without the skip this arm would require rebuilds above the per-version floor while the index is still valid."
+  STDERR.puts "--disabled needs GCRY_DISABLE_POOL_INDEX=1: this arm measures the cost of rebuilding on every refill."
   exit 64
 end
 

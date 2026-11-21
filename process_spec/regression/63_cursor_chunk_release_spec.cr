@@ -1,10 +1,11 @@
 require "../../src/gcry"
 require "spec"
+require "../support/release_guard_heap"
 
 # The post-STW flush released a queued-empty chunk an allocation cursor stood
 # on. The sweep unlinks an empty chunk and queues it, but its index entry
-# lives until the flush, and a refill validates a pooled address against
-# that index: it takes the chunk and sets CURSOR under `@chunk_list_lock`,
+# lives until the flush. A refill used to validate a pooled address against
+# that index alone. It took the chunk and set CURSOR under `@chunk_list_lock`,
 # then lets go of the lock before its first `occ` store. Until 2026-10-11
 # the flush kept a queued chunk only when its `occ` popcount was non-zero, so
 # a flush waiting on that lock read zero and unmapped the chunk under the
@@ -13,12 +14,10 @@ require "spec"
 # `fast_alloc`, with no refusal counted. CI run 34787711949 reached the
 # window with real mutators.
 #
-# The construction is `bench/occupied_release.cr` (`make occupied-release`):
-# a library heap, so nothing but this file allocates on the heap under test,
-# and its two `post_stw_hook` stages on the collector's thread. The block the
-# hook takes out of a queued chunk is freed again before the flush, which
-# leaves `occ` empty with the cursor still on the chunk. Each arm runs in a
-# process of its own: before the fix the first one dies of SIGSEGV.
+# Refill during the sweep/flush window and verify that the queued chunks
+# stay off the pool. Check the flush's independent refusal decision on the
+# fresh chunk while it is still mapped. A forced refusal in the cursor arm
+# exercises the real flush's accounting and reinsertion on the live list.
 #
 # The heap's counters must also agree with its index afterwards. A refused
 # chunk is mapped and indexed, but the sweep had already taken it out of
@@ -72,9 +71,9 @@ private def cursor_release_counters_agree(heap : Gcry::Heap, label : String) : N
 end
 
 # Walk the window: the first major puts every chunk on grace, the second
-# queues them, and `:before_flush` takes a block out of a queued chunk. With
-# *free_taken* the block is freed again at once, so the flush finds the chunk
-# empty with the cursor on it. Returns the block and its chunk.
+# queues them, and `:before_flush` exhausts the remaining cursor. With
+# *free_taken* the fresh block is freed again at once, leaving its cursor on
+# an empty chunk. Returns the block and its chunk.
 private def cursor_release_window(heap : Gcry::Heap, roots : Array(Void*),
                                   free_taken : Bool) : {Void*, UInt64}
   blocks_per_chunk = heap.small_chunk_bytes // CURSOR_RELEASE_SIZE
@@ -105,16 +104,19 @@ private def cursor_release_window(heap : Gcry::Heap, roots : Array(Void*),
         roots << p
       end
       heap.free(taken) if free_taken && !taken.null?
+      heap.refuse_empty_release_budget = 1 if free_taken
     end
     nil
   end
   heap.collect(scan_stack: false, roots: roots)
   heap.post_stw_hook = nil
 
-  # The construction must reach the window, or every arm passes on nothing:
-  # a block came out of an already-mapped chunk the flush then considered.
+  # The sweep queued real chunks. Refill had to map a new one.
   fail "no block was taken in the window" if taken.null?
-  (heap.chunks_mapped - mapped_before).should eq(0)
+  (heap.chunks_mapped - mapped_before).should eq(1)
+  heap.release_refused_occupied.should eq(0)
+  heap.release_refused_cursor.should eq(0)
+  heap.release_refused_forced.should eq(free_taken ? 1 : 0)
   (heap.release_flush_chunks - considered_before).should be > 0
   {taken, taken_chunk}
 end
@@ -139,6 +141,8 @@ describe "Regression: the empty-chunk flush keeps a chunk a cursor stands on" do
     roots = [] of Void*
     refused_before = heap.release_refused_occupied
     taken, taken_chunk = cursor_release_window(heap, roots, free_taken: true)
+    heap.would_refuse_release_for_spec?(taken).should be_true
+    heap.release_refused_cursor.should eq(1)
     p = heap.malloc(CURSOR_RELEASE_SIZE)
     p.as(UInt8*).value = 0xA5_u8
     cursor_release_chunk_of(heap, p).should eq(taken_chunk)
@@ -160,17 +164,17 @@ describe "Regression: the empty-chunk flush keeps a chunk a cursor stands on" do
     heap.destroy
   end
 
-  # The block stays allocated: the refusal this flush already made. Its
-  # counters are the part that was wrong.
+  # An occupied block alone must also make the flush decline release.
   it "cursor-chunk-release child occupied" do
     next unless ENV["GCRY_CURSOR_RELEASE_CHILD"]? == "occupied"
     heap = cursor_release_heap(control: false)
     roots = [] of Void*
     refused_before = heap.release_refused_occupied
     taken, _ = cursor_release_window(heap, roots, free_taken: false)
+    heap.would_refuse_release_for_spec?(taken).should be_true
     (heap.release_refused_occupied - refused_before).should eq(1)
     heap.is_heap_ptr(taken).should be_true
-    cursor_release_counters_agree(heap, "after the refused flush")
+    cursor_release_counters_agree(heap, "after the flush")
     roots << taken
     heap.collect(scan_stack: false, roots: roots)
     heap.live?(taken).should be_true
@@ -178,15 +182,14 @@ describe "Regression: the empty-chunk flush keeps a chunk a cursor stands on" do
     heap.destroy
   end
 
-  # `release_occupied_anyway` — the pre-fix decision — on the same
-  # construction: the chunk goes. That the window is still reached on a
-  # fixed tree is what makes the cursor arm's survival attributable. The
-  # cursor still names the unmapped chunk, so nothing may allocate here after.
+  # Check the legacy release decision for an empty cursor-owned chunk.
   it "cursor-chunk-release child control" do
     next unless ENV["GCRY_CURSOR_RELEASE_CHILD"]? == "control"
     heap = cursor_release_heap(control: true)
     roots = [] of Void*
     taken, _ = cursor_release_window(heap, roots, free_taken: true)
-    heap.is_heap_ptr(taken).should be_false
+    heap.would_refuse_release_for_spec?(taken).should be_false
+    heap.release_refused_cursor.should eq(1)
+    heap.destroy
   end
 end

@@ -1931,18 +1931,10 @@ kept-release-report: $(BIN)
 	$(CRYSTAL) build -Dgc_none bench/kept_release_report.cr -o $(BIN)/kept_release_report --error-trace
 	$(BIN)/kept_release_report
 
-# Does a pool refill walk the chunk list, and how does that scale? The note this
-# retires said "walks every chunk of the class per refill: O(chunks)". Measured:
-# the walk happens once per *capacity version*, each sweep bumps that version,
-# and the count is 2.0 rebuilds per collection — one per active class slot —
-# whether the class holds 29 chunks or 598. The cost per allocation does grow
-# linearly with the chunk count, which is the arithmetic of a constant rebuild
-# rate, and it is 0.391% of what the sweep walks in the same collection (512
-# blocks per chunk at 256 B). Fails if rebuilds per collection exceed one per
-# active slot, i.e. if the index starts being invalidated mid-collection, which
-# is the only way this becomes the per-refill walk. Until 2026-09-20 the
-# only way it came out red was a hand edit of that floor. Three arms, ~13 s
-# plus the disable arm.
+# Count class-directory rebuilds and visits as the live small-object set
+# grows. Small bursts of returned capacity can be merged without a rebuild.
+# The disabled arm forces discovery on every refill and must cross the
+# eight-rebuilds-per-collection limit the cached arms must meet.
 pool-refill-cost: $(BIN)
 	$(CRYSTAL) build --release -Dgc_none bench/pool_refill_cost.cr -o $(BIN)/pool_refill_cost --error-trace
 	$(BIN)/pool_refill_cost
@@ -2039,20 +2031,9 @@ fiber-lag-cost: $(BIN)
 		bench/fiber_lag_cost.cr -o $(BIN)/fiber_lag_cost --error-trace
 	$(BIN)/fiber_lag_cost
 
-# The window that released a chunk with a live block in it (CI `34787711949`,
-# 2026-09-14): the sweep queues an empty chunk, its index entry survives until
-# the post-STW flush, and the allocator resolves pooled chunk addresses through
-# that index — so a mutator can take a block out of a chunk already queued for
-# unmapping. The flush now refuses such a chunk and keeps it mapped.
-#
-# Walked on purpose, on a library heap, through `Heap#post_stw_hook`: one
-# allocation after `start_world` builds the pool from the still-intact list,
-# the after-world sweep queues the idle chunks behind it, and exhausting the
-# taken chunk before the flush pops a queued one through the index. Until
-# 2026-09-21 the recipe tried to reach that with thread churn (0 of 48 here)
-# and ran both arms under `-`. Both arms now require the window to be hit:
-# shipped must refuse once and keep the block; `--broken` restores the pre-fix
-# release and must lose the block's chunk. ~2 s.
+# Refill while empty chunks await the post-STW flush. The new block must
+# come from a fresh chunk. Also check the flush's independent decision on
+# an occupied chunk while it is still mapped, including the legacy control.
 occupied-release: $(BIN)
 	$(CRYSTAL) build bench/occupied_release.cr -o $(BIN)/occupied_release --error-trace
 	$(BIN)/occupied_release

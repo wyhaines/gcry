@@ -889,7 +889,7 @@ module GC
     heap.force_serial_mark = true if env_flag_one?("GCRY_DISABLE_PARALLEL_MARK")
     # Research only: invalidate the bitmap pool index on every take, so each
     # refill walks the class again. `make pool-refill-cost --disabled` is the
-    # red arm — rebuilds per collection exceed the per-version floor.
+    # control arm and must exceed eight rebuilds per collection on this workload.
     heap.pool_index_disabled = true if env_flag_one?("GCRY_DISABLE_POOL_INDEX")
     # Research only: gate nursery mark clear on the global `@bitmap_marks`
     # flag. `make nursery-bitmap-marks --disabled` is the red arm — a

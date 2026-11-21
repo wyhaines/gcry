@@ -869,13 +869,8 @@ module Gcry
 
       @pending_empty_chunks = Pointer(ChunkHeader).null
 
-      # The window that released a chunk with a live block in it is open
-      # here: the sweep unlinked these chunks, their index entries survive
-      # until the `index_remove` below, and the world is running. Research
-      # only (`Heap#post_stw_hook`): a mutator placed here on the collector's
-      # thread reaches it every run — `make occupied-release`. The sleep that
-      # used to widen it for thread churn reached it 0 of 48 on a developer
-      # host and is gone.
+      # The queued chunks are still indexed. Regression 63 refills here to
+      # check that live pool membership excludes them until the flush ends.
       if hook = @post_stw_hook
         hook.call(:before_flush)
       end
@@ -900,15 +895,10 @@ module Gcry
       end
     end
 
-    # A chunk the sweep queued as empty can be occupied again by the time this
-    # flush runs, and then releasing it unmaps a live block.
-    #
-    # The window is structural: the sweep unlinks the chunk from `@chunks`
-    # inside the stop, but its entry stays in `@chunk_index` until
-    # `index_remove` below — and the allocator validates a pooled chunk address
-    # against exactly that index (`bitmap_indexed_chunk`). Under multi-mutator
-    # STW this flush runs *after* `start_world`, so a mutator is free to take a
-    # block out of a chunk that is already queued for unmapping.
+    # Check occupancy immediately before unmapping. The address index keeps
+    # a queued chunk until this flush removes it. Refills also check live pool
+    # membership now, but a stale candidate once let a mutator take a block
+    # from a queued chunk after the world restarted.
     #
     # Seen on CI 2026-09-14 (run `34787711949`), in the first sighting the crash
     # report could read after the release ledger was hoisted above the heap-span

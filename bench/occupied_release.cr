@@ -1,59 +1,10 @@
-# A chunk released with a live block in it — the window, constructed.
-#
-# The sweep unlinks an empty chunk from `@chunks` and queues it for the
-# post-STW flush, but its `@chunk_index` entry survives until that flush calls
-# `index_remove`. The allocator validates a pooled chunk address against
-# exactly that index, and `bitmap_pool_candidate?` accepts a chunk whose blocks
-# are all free — which a queued chunk's are, by construction. So between the
-# sweep and the flush a mutator can take a block out of a chunk that is about
-# to be unmapped.
-#
-# First read on CI 2026-09-14 (run `34787711949`):
-#
-#   gcry: SIGSEGV at 0x7f6e5cea0014 — in a chunk gcry RELEASED — base
-#   0x7f6e5cea0000, 131072 bytes, empty size-class chunk release, at collection
-#   206; the write is 20 bytes into it. Collections since: 0. Blocks still
-#   allocated at release: 1
-#
-# Until 2026-09-21 this harness tried to *reach* that window with thread churn
-# and a held flush, and on a developer host it did not — 0 of 48 — so both
-# arms ran under `-` and the gate could not fail. The window has a shape that
-# a single thread can walk on purpose, and this is it:
-#
-#   1. Fill a size class with garbage across several chunks; collect once.
-#      Every chunk is empty and on its one cycle of grace (`IDLE`), and the
-#      class's pool version is bumped by the reclaim.
-#   2. Collect again, with a mutator on the collector's own thread at the two
-#      points `Heap#post_stw_hook` offers:
-#      - `:after_start_world` — the world runs, `@chunks` is intact, the
-#        after-world sweep has not run. One allocation retires the settled
-#        cursor and rebuilds the pool from that list: every idle chunk goes
-#        in, the lowest is taken, the rest wait behind `next_index`.
-#      - the sweep then finds the idle chunks still empty, frees nothing in
-#        them (so the version stands), and queues them: off `@chunks`, still
-#        in the index.
-#      - `:before_flush` — exhaust the taken chunk. The refill pops the next
-#        pooled address, the index still answers for it, `bitmap_pool_candidate?`
-#        accepts it, and a block is handed out of a chunk queued for unmapping.
-#   3. The flush runs. Shipped: it finds the chunk occupied, counts the
-#      refusal, keeps it mapped and relinks it. Pre-fix
-#      (`release_occupied_anyway`): it unmaps the chunk under the block.
-#
-#   crystal build bench/occupied_release.cr -o bin/occupied_release
-#   bin/occupied_release            # refused once; the block is in the heap and live
-#   bin/occupied_release --broken   # released anyway; the block's chunk is gone
-#
-# Both arms require the window to have been hit — `release_refused_occupied`
-# must go up by exactly one, and the block must have come out of a chunk that
-# was already mapped rather than a fresh `map_chunk` — so a construction that
-# stops reaching the window fails instead of passing on nothing. Dropping the
-# refusal reddens the shipped arm; dropping the knob reddens `--broken`.
-#
-# A library heap, not the process GC: the harness's own strings and arrays go
-# to Boehm, so nothing but this script allocates on the heap under test and
-# the construction is exact.
-
+# The sweep removes empty chunks from the class directory before flushing
+# them. Exhaust a cursor in that window. The refill must map a fresh chunk,
+# and every queued chunk must remain empty. Then ask the flush for its release
+# decision on the newly allocated block, while its chunk is still mapped.
+# The historical control (--broken) must give the opposite decision.
 require "../src/gcry"
+require "../process_spec/support/release_guard_heap"
 
 SIZE = 4096_u64
 
@@ -82,8 +33,8 @@ def chunk_of(heap : Gcry::Heap, p : Void*) : UInt64
   found[1].address
 end
 
-puts "=== a chunk released with a live block in it ==="
-puts "mode: #{broken ? "broken (release an occupied chunk anyway — the pre-fix behaviour)" : "shipped (refuse)"}"
+puts "=== bitmap refill during the release flush ==="
+puts "mode: #{broken ? "legacy occupied-chunk decision" : "refuse an occupied chunk"}"
 
 # 1. Several chunks of garbage; one major puts every chunk on grace.
 blocks_per_chunk = heap.small_chunk_bytes // SIZE
@@ -126,7 +77,7 @@ heap.post_stw_hook = ->(stage : Symbol) do
   end
 end
 
-# 2. The second major: the sweep queues the idle chunks, the hook takes one.
+# 2. The second major queues the idle chunks. Refill before the flush.
 heap.collect(scan_stack: false, roots: roots)
 heap.post_stw_hook = nil
 
@@ -140,41 +91,15 @@ puts "chunks mapped during the window: #{fresh_maps}"
 puts "block taken in the window:       #{taken} in chunk 0x#{taken_chunk.to_s(16)}"
 
 failures << "no block was taken in the window" if taken.null?
-failures << "the block came from a fresh map_chunk, not through the index (#{fresh_maps} mapped)" if fresh_maps != 0
-failures << "the flush queued nothing, so there was no window (#{considered} considered)" if considered == 0
-failures << "the window was not hit: #{refused} refusal(s), expected 1" if refused != 1
-
-if failures.empty?
-  in_heap = heap.is_heap_ptr(taken)
-  if broken
-    # The chunk is unmapped under the block; the cursor slot still names it,
-    # so nothing below may allocate on this heap or destroy it.
-    if in_heap
-      failures << "release_occupied_anyway did not release the occupied chunk — the block is still in the heap"
-    else
-      puts "ok — the pre-fix behaviour reached the window and unmapped chunk 0x#{taken_chunk.to_s(16)} with"
-      puts "a live block in it. That is what the shipped arm refuses, and why the refusal is not theoretical."
-    end
-  else
-    if in_heap
-      # Mapped: a write is safe, and it is the write the CI crash faulted on.
-      taken.as(UInt8*).value = 0xA5_u8
-      roots << taken
-      heap.collect(scan_stack: false, roots: roots)
-      failures << "the block was refused-for and kept mapped, then swept" unless heap.live?(taken)
-    else
-      failures << "the refusal was counted and the chunk was released anyway"
-    end
-    if failures.empty?
-      puts "ok — the chunk was queued as empty, had a block in it when the flush ran, and was"
-      puts "kept mapped and put back on the live list; the block survives a rooted collection."
-    end
-  end
+failures << "refill should map one fresh chunk (#{fresh_maps} mapped)" unless fresh_maps == 1
+failures << "the sweep queued no chunks" if considered == 0
+failures << "refill occupied a queued chunk" unless refused == 0
+unless taken.null?
+  failures << "the new block should still be allocated" unless heap.live?(taken)
+  decision = heap.would_refuse_release_for_spec?(taken)
+  failures << "unexpected occupied-chunk release decision: #{decision}" unless decision == !broken
+  failures << "the occupied-block check never fired" unless heap.release_refused_occupied == refused_before + 1
 end
-
-unless failures.empty?
-  failures.each { |f| puts "FAIL #{f}" }
-  exit 1
-end
-heap.destroy unless broken
-exit 0
+heap.destroy
+abort failures.join("\n") unless failures.empty?
+puts "ok — refill skipped queued chunks and the occupied-chunk release decision matched this arm"

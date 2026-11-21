@@ -2,6 +2,12 @@ require "./spec_helper"
 
 class Gcry::Heap
   property fail_pool_growth_for_spec = false
+  property fail_candidate_growth_for_spec = false
+
+  private def bitmap_pool_grow(pool : Gcry::BitmapPoolIndex*, needed : Int32) : Bool
+    return false if @fail_candidate_growth_for_spec
+    previous_def
+  end
 
   private def bitmap_directory_resize(dir : Gcry::BitmapClassDirectory*, capacity : Int32) : Bool
     return false if @fail_pool_growth_for_spec && capacity > dir.value.capacity
@@ -209,6 +215,8 @@ describe "bitmap pool capacity search" do
       heap.blacklist_enabled = false
       heap.nursery_enabled = false
       heap.release_empty_chunks = true
+      heap.parallel_empty_chunk_dormant = true
+      heap.parallel_empty_chunk_munmap = true
       heap.empty_chunk_retain = 0_u64
       heap.gc_threshold = UInt64::MAX
       keep = heap.full_pool_chunk_representatives_for_spec(48)[3]
@@ -219,6 +227,24 @@ describe "bitmap pool capacity search" do
       heap.pool_directory_bytes_for_spec.should eq(floor)
       heap.collect(scan_stack: false, release_warm: true)
       heap.pool_directory_bytes_for_spec.should eq(0)
+    ensure
+      heap.destroy
+    end
+  end
+
+  it "finds freed capacity while the candidate buffer is unavailable and after it recovers" do
+    heap = Gcry::Heap.new
+    begin
+      heap.bitmap_alloc = true
+      heap.nursery_enabled = false
+      heap.blacklist_enabled = false
+      heap.gc_threshold = UInt64::MAX
+      heap.fail_candidate_growth_for_spec = true
+      users = heap.full_pool_chunk_representatives_for_spec(6)
+      users.each { |user| heap.free(user) }
+      heap.malloc(8192).should eq(users.first)
+      heap.fail_candidate_growth_for_spec = false
+      users[1..].each { |user| heap.malloc(8192).should eq(user) }
     ensure
       heap.destroy
     end
@@ -237,6 +263,8 @@ describe "bitmap pool capacity search" do
       users.each { |user| heap.free(user) }
       users.each { |user| heap.malloc(8192).should eq(user) }
       heap.release_empty_chunks = true
+      heap.parallel_empty_chunk_dormant = true
+      heap.parallel_empty_chunk_munmap = true
       heap.empty_chunk_retain = 0_u64
       heap.empty_chunk_warm_retain = 0_u64
       heap.collect(scan_stack: false, release_warm: true)
@@ -277,6 +305,8 @@ describe "bitmap pool capacity search" do
       heap.gc_threshold = UInt64::MAX
       heap.blacklist_enabled = false
       heap.release_empty_chunks = true
+      heap.parallel_empty_chunk_dormant = true
+      heap.parallel_empty_chunk_munmap = true
       heap.empty_chunk_retain = 0_u64
       heap.empty_chunk_warm_retain = 0_u64
       2.times do

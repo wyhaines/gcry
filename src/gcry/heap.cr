@@ -4189,7 +4189,6 @@ module Gcry
       # which the caller unmaps it and the next walker faults.
       @chunk_list_lock.sync do
         @chunk_unlinks &+= 1
-        bitmap_pool_unlink(target) if bitmap_pool_member?(target)
         # `index_remove`, with the back-link's check in the same section: the
         # check reads the index and, if the chunk the link names is in it,
         # that chunk's `next`.

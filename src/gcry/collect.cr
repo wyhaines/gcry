@@ -823,13 +823,10 @@ module Gcry
     # Research only, library heaps: a mutator on the collector's own thread
     # at the two points the window that released an occupied chunk runs
     # between. `:after_start_world` — world running, `@chunks` intact, the
-    # after-world sweep not yet run (lazy config); a pool built here is
-    # built from a list the sweep is about to unlink from, at a version the
-    # sweep will not bump for a chunk it frees nothing in. `:before_flush` —
-    # chunks queued, off `@chunks`, index entries still alive, no lock held;
-    # a cursor exhausted here refills from that pool through the index. That
-    # is the whole window, deterministically, which is what makes
-    # `make occupied-release` a gate rather than a sighting. And
+    # after-world sweep not yet run (lazy config). At `:before_flush` the
+    # empty chunks are queued and off the live list, their index entries
+    # still present. `make occupied-release` refills at this point to check
+    # the allocator skips those chunks.
     # `:before_relink_store` — the after-world sweep has walked `@chunks` and
     # not yet published its rebuild, no lock held; a chunk mapped here is a
     # prepend inside that window (`make chunk-list-drift`, on a process heap,
